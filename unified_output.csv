@@ -1,0 +1,31 @@
+hospital,payer,family,code,status,hospital_rate,reported_part,hospital_full,payer_full,payer_x_medicare,price_ratio,price_consistency,decision
+Montefiore Medical Center,AETNA,CPT,43239,both,1320.76,professional,16697.55331534026,11453.63,2.02,1.46,0.86,match
+Montefiore Medical Center,AETNA,CPT,99283,both,377.13,professional,10706.851956268598,1873.7629706300943,0.86,5.71,0.02,non-match
+Montefiore Medical Center,AETNA,DRG,872,hospital_only,48629.3,facility,48629.3,NA,NA,NA,NA,unmatched
+Montefiore Medical Center,CIGNA,CPT,43239,both,841.81,professional,10642.484142756128,7697.504315200829,1.45,1.38,0.92,match
+Montefiore Medical Center,CIGNA,CPT,99283,both,301.08,professional,8547.765987838013,2155.26,3.22,3.97,0.07,match
+Montefiore Medical Center,CIGNA,DRG,872,both,44909.82,facility,44909.82,47574.46,6.97,0.94,0.61,review (no professional part to model)
+Montefiore Medical Center,UHC,CPT,43239,both,688.3,professional,8701.75198139609,13325.325,4.68,0.65,0.27,match
+Montefiore Medical Center,UHC,CPT,99283,both,211.16,professional,5994.905892094708,4218.521815241299,1.92,1.42,0.89,match
+Montefiore Medical Center,UHC,DRG,872,both,57020.41,facility,57020.41,15902,2.33,3.59,0.11,review (no professional part to model)
+NYU Langone,AETNA,CPT,43239,both,8124.66,facility,8822.51199823781,10275.355,1.55,0.86,0.51,match
+NYU Langone,AETNA,CPT,99283,both,2490,facility,2580.907935758148,2382.88,1.07,1.08,0.77,match
+NYU Langone,AETNA,DRG,872,hospital_only,25883.26,facility,25883.26,NA,NA,NA,NA,unmatched
+NYU Langone,AETNA,LOCAL,43239,hospital_only,6894.2,NA,NA,NA,NA,NA,NA,unmatched
+NYU Langone,CIGNA,CPT,43239,both,6034,facility,6552.278790419162,9762.700733798763,1.82,0.67,0.29,match
+NYU Langone,CIGNA,CPT,99283,both,2738,facility,2837.9622201228153,2846.57,1.38,1,0.67,match
+NYU Langone,CIGNA,DRG,872,both,29907,facility,29907,29907.25,4.38,1,0.67,review (no professional part to model)
+NYU Langone,CIGNA,LOCAL,43239,hospital_only,10932.22,NA,NA,NA,NA,NA,NA,unmatched
+NYU Langone,UHC,CPT,43239,both,7892.93,facility,8570.877996894782,5820.15,5.45,1.47,0.84,match
+NYU Langone,UHC,CPT,99283,both,2404.74,facility,2492.535160415682,1999.5322124466297,0.9,1.25,0.94,match
+NYU Langone,UHC,DRG,872,both,34416.84,facility,34416.84,26462.675000000003,3.87,1.3,1,review (no professional part to model)
+NYU Langone,UHC,LOCAL,43239,hospital_only,5170.65,NA,NA,NA,NA,NA,NA,unmatched
+The Mount Sinai Hospital,AETNA,CPT,43239,both,2992.73,facility,3249.78477037639,6543.82,4.76,0.5,0.12,match
+The Mount Sinai Hospital,AETNA,CPT,99283,payer_only,NA,NA,NA,131.835,0.76,NA,NA,unmatched
+The Mount Sinai Hospital,AETNA,DRG,872,both,29259.18,facility,29259.18,13365,1.96,2.19,0.41,review (no professional part to model)
+The Mount Sinai Hospital,CIGNA,CPT,43239,both,4289.89,facility,4658.36182635586,6505.454054666416,1.25,0.72,0.34,match
+The Mount Sinai Hospital,CIGNA,CPT,99283,payer_only,NA,NA,NA,3729.3561185146855,1.92,NA,NA,unmatched
+The Mount Sinai Hospital,CIGNA,DRG,872,both,25906.6,facility,25906.6,22020.325,3.22,1.18,0.87,review (no professional part to model)
+The Mount Sinai Hospital,UHC,CPT,43239,payer_only,NA,NA,NA,4051.885,1.86,NA,NA,unmatched
+The Mount Sinai Hospital,UHC,CPT,99283,payer_only,NA,NA,NA,1562.6047561133391,0.74,NA,NA,unmatched
+The Mount Sinai Hospital,UHC,DRG,872,payer_only,NA,NA,NA,16818.465,2.46,NA,NA,unmatched

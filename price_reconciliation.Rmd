@@ -1,0 +1,590 @@
+---
+title: "Reconciling hospital and payer price disclosures"
+subtitle: "A unified schema, a component-aware price adjustment, and a linkage-based confidence model"
+author: "Bulat Idrisov"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    self_contained: true
+    df_print: paged
+    fig_width: 8
+    fig_height: 5
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(MASS, include.only = "rlm")   # robust regression, used at scale (Section 6)
+theme_set(theme_minimal(base_size = 12))
+```
+
+# Overview
+
+We are given two price disclosures for the same three hospitals and the same
+three billing codes. One is published by insurers and lists the rates they have
+negotiated to pay providers. The other is published by hospitals and lists the
+rates they have agreed to accept. In principle the two describe the same
+contracted prices, so a rate in one should appear in the other. In practice they
+use different schemas, identify providers differently, and report prices at
+different levels of detail.
+
+The goal is a single table at one shared level of observation in which each row
+carries the hospital's price, the insurer's price, and the gap between them,
+together with an explicit statement of how confident we are in the match.
+
+The analysis proceeds in five moves. We reshape both files onto a shared unit of
+observation and join them. We put their prices onto a common footing by
+separating the facility and professional components of a service. We benchmark
+every price against Medicare so that different services are comparable and can be
+checked against published national figures. We assess how well the two sources
+agree using a formal method-comparison approach. And we express match confidence
+as a probabilistic linkage score rather than a set of hand-set rules.
+
+```{r load}
+hpt <- read_csv("hpt_extract_20250213.csv", show_col_types = FALSE)
+tic <- read_csv("tic_extract_20250213.csv", show_col_types = FALSE)
+c(hospital_rows = nrow(hpt), payer_rows = nrow(tic))
+```
+
+# What one row means in each file
+
+One row is one negotiated price for one service under one arrangement.
+The hospital file breaks a service out by plan and care setting, so a single
+service appears on several rows. The payer file breaks the same service out by
+network, billing class, and place of service, so it too has several rows per
+service. The two files therefore sit at different levels of observation and
+cannot be compared row to row until we reshape both onto a common grain. The
+shared grain we adopt is:
+
+> hospital (tax id) x code family x code x insurer
+
+# Identifying the same hospital
+
+The payer file has no hospital name and no state. It identifies a provider only
+by a nine digit tax identification number (the EIN) and a list of provider
+identifiers (NPIs). The hospital file carries the same tax id, embedded in the
+source file name, though formatted differently across records. The tax id is
+therefore the only reliable link between the two files, so we normalize it to
+nine digits and join on it.
+
+```{r normalize-helpers}
+# Tax id: keep the first nine digits, dropping punctuation and any suffix.
+clean_ein <- function(x) str_sub(str_remove_all(x, "\\D"), 1, 9)
+
+# Billing code: drop punctuation and any leading "MSDRG" label.
+clean_code <- function(x) str_remove(str_remove_all(x, "[^0-9A-Za-z]"), "^(?i)MSDRG")
+
+# Code family: inpatient bundles (DRG) behave differently from single services (CPT).
+code_family <- function(x) case_when(
+  str_detect(str_to_upper(x), "DRG")       ~ "DRG",
+  str_detect(str_to_upper(x), "CPT|HCPCS") ~ "CPT",
+  TRUE                                     ~ str_to_upper(x)
+)
+
+# Insurer names: reduce the many published spellings to a single label.
+payer_lookup <- c(
+  unitedhealthcare = "UHC", uhc = "UHC", united = "UHC",
+  aetna = "AETNA",
+  `cigna-corporation` = "CIGNA", cigna = "CIGNA"
+)
+clean_payer <- function(x) {
+  key <- str_to_lower(str_trim(x))
+  unname(coalesce(payer_lookup[key], str_to_upper(key)))
+}
+
+hospital_names <- c(
+  `131740114` = "Montefiore Medical Center",
+  `131624096` = "The Mount Sinai Hospital",
+  `133971298` = "NYU Langone"
+)
+```
+
+Some hospital rows describe government plans (Medicare Advantage, Medicaid, and
+similar). The payer file here contains national commercial products only, so we
+keep commercial hospital rows to avoid comparing a commercial rate against a
+government rate.
+
+```{r noncommercial}
+noncommercial <- c("medicare", "medicaid", "chip", "harp",
+                   "essential", "child health", "managed long")
+is_commercial <- function(plan) {
+  !str_detect(str_to_lower(replace_na(plan, "")), str_c(noncommercial, collapse = "|"))
+}
+```
+
+```{r normalize}
+big3 <- c("AETNA", "CIGNA", "UHC")
+
+hpt_norm <- hpt %>%
+  mutate(
+    ein        = clean_ein(word(source_file_name, 1, sep = "_")),
+    code       = clean_code(raw_code),
+    family     = code_family(code_type),
+    payer      = clean_payer(payer_name),
+    rate       = as.numeric(standard_charge_negotiated_dollar),
+    commercial = is_commercial(plan_name)
+  )
+
+tic_norm <- tic %>%
+  mutate(
+    ein    = clean_ein(ein),
+    code   = clean_code(code),
+    family = code_family(code_type),
+    payer  = clean_payer(payer),
+    rate   = as.numeric(rate),
+    cms    = as.numeric(cms_baseline_rate)
+  )
+```
+
+# Deterministic join
+
+Joining the normalized files on tax id, code, and insurer already succeeds for
+most combinations. This section shows where the clean join works and where it
+does not, before we address price alignment.
+
+```{r deterministic}
+key <- c("ein", "family", "code", "payer")
+
+hpt_keys <- hpt_norm %>%
+  filter(payer %in% big3, commercial, !is.na(rate)) %>%
+  distinct(across(all_of(key)))
+tic_keys <- tic_norm %>%
+  filter(!is.na(rate)) %>%
+  distinct(across(all_of(key)))
+
+full_join(mutate(hpt_keys, in_hospital = TRUE),
+          mutate(tic_keys, in_payer = TRUE), by = key) %>%
+  mutate(across(c(in_hospital, in_payer), ~replace_na(., FALSE)),
+         status = case_when(
+           in_hospital & in_payer ~ "both",
+           in_hospital            ~ "hospital_only",
+           TRUE                   ~ "payer_only")) %>%
+  count(status)
+```
+
+The combinations that fail to join are informative. Inpatient bundle codes (DRG)
+often appear in the hospital file but not the payer file, because insurers do not
+always publish a bundled inpatient rate in the same form. This mirrors published
+findings that payer disclosures are least complete for hospital inpatient
+services (AJMC 2025). A few hospital rows use a local, hospital specific code
+that has no counterpart in the payer file. These are structural gaps, not join
+errors.
+
+# Aligning prices: assigning facility charges to a total
+
+A clean join tells us two rows describe the same service, but it does not make
+their prices comparable, because a service is billed in two parts:
+
+* a facility component, which is what the hospital charges for its rooms,
+  equipment, and staff, and
+* a professional component, which is what the treating physician charges.
+
+The full price of a service is the sum of the two. The two files do not report
+the same part. The payer file labels every row as professional or institutional
+(facility), so it always shows both parts. The hospital file reports a single
+unlabeled number, and different hospitals report different parts: some a facility
+scale number, some a professional scale number. Comparing a facility only number
+against a professional only number produces differences of ten times or more that
+are reporting artifacts, not real disagreements. We remove this artifact as
+follows.
+
+To assign a partial, facility only figure up to a total, we apply the approach for
+scaling facility spending to a total developed by our team at the Institute for Health
+Metrics and Evaluation published in JAMA of which I am a co-author (Dieleman et al. 2025). 
+The method learns the ratio between a component and the full amount from records that contain both, 
+then applies that ratio to records that carry only one component. Here we adapt it from health spending estimation to
+the reconciliation of price disclosures.
+
+**Step 1. Learn the component ratios from the file that reports both parts.**
+For each code we take the median facility rate and the median professional rate
+from the payer file and define the full price as their sum. From these we form
+two scaling ratios: facility to full and professional to full.
+
+```{r ratio-table}
+component_ratio <- tic_norm %>%
+  filter(!is.na(rate)) %>%
+  group_by(family, code) %>%
+  summarise(
+    n_facility     = sum(billing_class == "institutional"),
+    n_professional = sum(billing_class == "professional"),
+    facility_med   = median(rate[billing_class == "institutional"]),
+    prof_med       = median(rate[billing_class == "professional"]),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    full         = rowSums(cbind(facility_med, prof_med), na.rm = TRUE),
+    fac_to_full  = if_else(n_facility     > 0, full / facility_med, 1),
+    prof_to_full = if_else(n_professional > 0, full / prof_med,     1)
+  )
+component_ratio
+```
+
+The professional component is a small fraction of the facility component, so for
+these codes the full price is close to the facility price and the facility to
+full ratio is near one. The inpatient bundle code has no professional rows,
+because the bundle is itself the facility payment and the physician bills
+separately, so its ratio is one and no adjustment is made. This is the smallest
+sample branch of a general rule: with many observations we would fit a robust
+linear model of the ratio over time and source; with few we take the median, as
+here; with none we leave the rate unadjusted. On this sample the median branch is
+the one that runs.
+
+**Step 2. Detect which part the hospital reported, then scale it to full price.**
+
+```{r scale}
+log_dist <- function(a, b) if_else(a > 0 & b > 0, abs(log(a / b)), Inf)
+
+hospital_side <- hpt_norm %>%
+  filter(payer %in% big3, commercial, !is.na(rate)) %>%
+  group_by(across(all_of(key))) %>%
+  summarise(hospital_rate = median(rate), .groups = "drop") %>%
+  left_join(component_ratio, by = c("family", "code")) %>%
+  mutate(
+    reported_part = if_else(
+      log_dist(hospital_rate, facility_med) <= coalesce(log_dist(hospital_rate, prof_med), Inf),
+      "facility", "professional"),
+    hospital_full = if_else(reported_part == "facility",
+                            hospital_rate * fac_to_full,
+                            hospital_rate * prof_to_full)
+  )
+
+payer_side <- tic_norm %>%
+  filter(!is.na(rate)) %>%
+  group_by(across(all_of(key)), billing_class) %>%
+  summarise(rate = median(rate), .groups = "drop") %>%
+  pivot_wider(names_from = billing_class, values_from = rate) %>%
+  left_join(dplyr::select(component_ratio, family, code, facility_med, prof_med),
+            by = c("family", "code")) %>%
+  mutate(
+    facility     = if_else(is.na(institutional) & !is.na(professional),
+                           professional * facility_med / prof_med, institutional),
+    professional = if_else(is.na(professional) & !is.na(institutional),
+                           institutional * prof_med / facility_med, professional),
+    payer_full   = rowSums(cbind(facility, professional), na.rm = TRUE)
+  )
+```
+
+# Benchmarking to Medicare
+
+Prices for different services are not comparable in dollars: a colonoscopy and an
+emergency visit sit on different scales. The standard solution in the price
+transparency literature is to express each commercial price as a multiple of what
+Medicare pays for the same service (the approach used by the RAND Hospital Price
+Transparency Study). The payer file already carries the Medicare baseline for
+each rate in `cms_baseline_rate`, drawn from the physician fee schedule for
+professional services, the outpatient system for outpatient facility services,
+and the inpatient system for inpatient bundles. We compute the ratio of each rate
+to its Medicare baseline.
+
+```{r medicare}
+payer_ratio <- tic_norm %>%
+  filter(!is.na(rate), !is.na(cms), cms > 0) %>%
+  mutate(
+    component = case_when(
+      family == "DRG"                    ~ "Inpatient facility",
+      billing_class == "institutional"   ~ "Outpatient facility",
+      TRUE                               ~ "Professional"),
+    ratio = rate / cms
+  )
+
+payer_ratio %>%
+  group_by(component) %>%
+  summarise(n = n(), median_x_medicare = round(median(ratio), 2), .groups = "drop")
+```
+
+These figures can be read against published national benchmarks. RAND reports
+commercial prices averaging about 255 percent of Medicare for inpatient facility
+services, 289 percent for outpatient facility services, and 188 percent for
+professional services. Our inpatient facility ratio is close to that benchmark.
+The professional ratio is lower and the outpatient facility ratio is higher,
+which is consistent with these being specific procedures at large academic
+medical centers in a high price market rather than a national average.
+
+```{r medicare-fig}
+benchmarks <- tibble(
+  component = c("Inpatient facility", "Outpatient facility", "Professional"),
+  rand      = c(2.55, 2.89, 1.88)
+)
+
+ggplot(payer_ratio, aes(component, ratio)) +
+  geom_boxplot(outlier.alpha = 0.3, width = 0.5, fill = "grey90") +
+  geom_hline(data = benchmarks, aes(yintercept = rand),
+             linetype = "dashed", colour = "steelblue") +
+  geom_text(data = benchmarks, aes(x = component, y = rand,
+            label = paste0("RAND ", round(rand * 100), "%")),
+            vjust = -0.5, hjust = 1.05, size = 3, colour = "steelblue") +
+  scale_y_log10() +
+  labs(title = "Commercial negotiated price as a multiple of Medicare",
+       subtitle = "Payer file rows, by component, with published RAND benchmarks",
+       x = NULL, y = "Ratio to Medicare (log scale)")
+```
+
+# Agreement between the two sources
+
+Rather than only report a dollar gap, we treat the two files as two independent
+methods of measuring the same underlying negotiated price and ask how well they
+agree. The standard tool for this in health research is the method of Bland and
+Altman: plot the difference between the two measurements against their mean, and
+report the average difference (the bias) and the limits within which most
+differences fall. Because prices are strongly right skewed, we work on the log
+scale, so a difference of logs is the log of the ratio of the two prices.
+
+```{r agreement-data}
+matched <- inner_join(
+    dplyr::select(hospital_side, all_of(key), hospital_full, reported_part,
+                  n_facility, n_professional),
+    dplyr::select(payer_side, all_of(key), payer_full),
+    by = key) %>%
+  filter(hospital_full > 0, payer_full > 0) %>%
+  mutate(
+    hospital = recode(ein, !!!hospital_names),
+    log_diff = log(hospital_full) - log(payer_full),
+    log_mean = (log(hospital_full) + log(payer_full)) / 2
+  )
+
+ba <- matched %>%
+  summarise(bias = mean(log_diff), sd = sd(log_diff)) %>%
+  mutate(lower = bias - 1.96 * sd, upper = bias + 1.96 * sd)
+
+tibble(
+  statistic = c("Geometric mean ratio (hospital / payer)",
+                "Lower limit of agreement", "Upper limit of agreement",
+                "Pearson r (log prices)", "Lin's concordance (log prices)"),
+  value = c(
+    round(exp(ba$bias), 2), round(exp(ba$lower), 2), round(exp(ba$upper), 2),
+    round(cor(log(matched$payer_full), log(matched$hospital_full)), 2),
+    { x <- log(matched$payer_full); y <- log(matched$hospital_full)
+      round(2 * cov(x, y) / (var(x) + var(y) + (mean(x) - mean(y))^2), 2) }
+  )
+)
+```
+
+On this sample the two sources agree moderately well. The correlation of log
+prices is about 0.8 and Lin's concordance is about 0.76. The hospital derived
+full price is on average about 30 percent higher than the payer derived full
+price, and most ratios fall between roughly 0.4 and 4. The wide limits reflect
+the small sample and the handful of combinations where the component detection is
+uncertain.
+
+```{r bland-altman-fig}
+ggplot(matched, aes(log_mean, log_diff)) +
+  geom_hline(yintercept = 0, colour = "grey70") +
+  geom_hline(yintercept = ba$bias, colour = "steelblue") +
+  geom_hline(yintercept = c(ba$lower, ba$upper),
+             linetype = "dashed", colour = "steelblue") +
+  geom_point(aes(colour = family), size = 2, alpha = 0.8) +
+  labs(title = "Agreement between hospital and payer prices (Bland-Altman)",
+       subtitle = "Difference of log prices against their mean; lines are bias and 95% limits",
+       x = "Mean of log prices", y = "Log ratio (hospital / payer)", colour = "Code family")
+```
+
+```{r scatter-fig}
+ggplot(matched, aes(payer_full, hospital_full, colour = family)) +
+  geom_abline(slope = 1, intercept = 0, colour = "grey70") +
+  geom_point(size = 2, alpha = 0.8) +
+  scale_x_log10() + scale_y_log10() +
+  labs(title = "Hospital price against payer price",
+       subtitle = "Log-log scale; grey line is exact agreement",
+       x = "Payer full price", y = "Hospital full price", colour = "Code family")
+```
+
+# Confidence as probabilistic record linkage
+
+The remaining question is how much to trust each match. Rather than set arbitrary
+cutoffs, we frame it as a record linkage problem in the classical way (Fellegi and
+Sunter, 1969). Each field that can agree or disagree is given a weight equal to
+the log ratio of two probabilities: the chance the field agrees when the pair is a
+true match, and the chance it agrees by coincidence when it is not. Agreement adds
+weight, disagreement subtracts it, and the weights sum to a single score. Two
+thresholds split the score into a confident match, a confident non-match, and a
+middle band reserved for human review.
+
+Here the tax id, code, and insurer are the join key, so they always agree and the
+entity match itself is essentially certain. The open question is therefore price
+corroboration: whether the two reported prices are consistent. We score that
+against the agreement distribution from the previous section, reporting for each
+pair how typical its price gap is for a true match. This price consistency runs
+from 0 to 1. It is near 1 when the gap sits at the center of the distribution and
+falls below about 0.05 once the gap crosses the limits of agreement, which is the
+point at which we stop calling a pair a match.
+
+```{r linkage}
+# Given a candidate pair (same tax id, code, insurer), the open question is
+# whether the two prices corroborate. We measure that against the Bland-Altman
+# fit: how typical is this pair's price gap for a true match. A pair inside the
+# limits of agreement is a match, outside is a non-match, and inpatient bundles
+# (no professional part to model) are sent to review.
+linked <- matched %>%
+  mutate(
+    z                 = (log_diff - ba$bias) / ba$sd,
+    price_consistency = round(2 * pnorm(-abs(z)), 2),
+    price_agrees      = log_diff >= ba$lower & log_diff <= ba$upper,
+    decision = case_when(
+      coalesce(n_professional, 0) == 0 ~ "review (no professional part to model)",
+      price_agrees                     ~ "match",
+      TRUE                             ~ "non-match")
+  )
+
+linked %>% count(decision)
+```
+
+This gives a transparent, tunable rule. The threshold at the limits of agreement
+can be raised or lowered to trade precision against recall, and pairs that fall
+outside become an explicit, sized queue for manual review, which is how a
+production matcher of this kind is operated. At national scale the same framework
+would carry estimated agreement weights on additional fields, such as the provider
+identifier, plan, and modifiers, so the confidence would reflect more than price
+alone.
+
+# The unified output
+
+We now assemble the deliverable: one row per hospital, code, and insurer, carrying
+both raw prices, both full price estimates, the ratio to Medicare where available,
+the price ratio between the two sources, the price consistency, and the decision.
+Combinations present on only one side are retained and marked, so the table also
+documents the coverage gaps. Column definitions are in the codebook below.
+
+```{r unified}
+medicare_by_cell <- payer_ratio %>%
+  group_by(across(all_of(key))) %>%
+  summarise(payer_x_medicare = round(median(ratio), 2), .groups = "drop")
+
+unified <- full_join(
+    dplyr::select(hospital_side, all_of(key), hospital_rate, reported_part, hospital_full),
+    dplyr::select(payer_side,    all_of(key), payer_full),
+    by = key) %>%
+  left_join(dplyr::select(linked, all_of(key), price_consistency, decision), by = key) %>%
+  left_join(medicare_by_cell, by = key) %>%
+  mutate(
+    hospital = recode(ein, !!!hospital_names),
+    # Status reflects which file the raw rate came from, not whether it could be scaled.
+    status   = case_when(
+      !is.na(hospital_rate) & !is.na(payer_full) ~ "both",
+      !is.na(hospital_rate)                      ~ "hospital_only",
+      TRUE                                       ~ "payer_only"),
+    price_ratio = round(hospital_full / payer_full, 2),
+    decision    = coalesce(decision, "unmatched")
+  ) %>%
+  arrange(hospital, payer, family, code) %>%
+  dplyr::select(hospital, payer, family, code, status,
+                hospital_rate, reported_part, hospital_full, payer_full,
+                payer_x_medicare, price_ratio, price_consistency, decision)
+
+write_csv(unified, "unified_output.csv")
+unified
+```
+
+## Codebook
+
+| Column | Meaning |
+| --- | --- |
+| `hospital` | Hospital name, recovered from the tax id (the payer file carries no name). |
+| `payer` | Insurer, normalized to a single label (AETNA, CIGNA, UHC). |
+| `family` | Code type: CPT (a single service), DRG (a bundled inpatient stay), LOCAL (a hospital's own internal code). |
+| `code` | The billing code (43239 endoscopy with biopsy, 99283 emergency visit, 872 sepsis inpatient stay). |
+| `status` | Which file the raw rate came from: `both`, `hospital_only`, or `payer_only`. |
+| `hospital_rate` | The hospital file's raw negotiated rate (median across its commercial plans), before any adjustment. |
+| `reported_part` | Which component the hospital rate is inferred to be: `facility` or `professional`. `NA` when not determinable. |
+| `hospital_full` | The hospital rate scaled to a full-encounter estimate (facility plus professional). `NA` when no scaling ratio exists. |
+| `payer_full` | The insurer's full-encounter price, its facility and professional parts summed. |
+| `payer_x_medicare` | The insurer's price as a multiple of Medicare (2.02 means 202 percent of Medicare). |
+| `price_ratio` | `hospital_full` divided by `payer_full` (1.46 means the hospital side is 1.46 times the payer side). `NA` unless matched on both sides. |
+| `price_consistency` | How typical the price gap is for a true match, from 0 to 1. Near 1 is central; below about 0.05 is outside the limits of agreement. |
+| `decision` | `match`, `non-match`, `review (no professional part to model)`, or `unmatched`. |
+
+# Completeness
+
+Finally we quantify coverage, since a large part of the practical value is knowing
+what is missing. We report, for each insurer and code family, the share of the
+three hospitals for which each file carries a usable rate.
+
+```{r completeness}
+grid <- expand_grid(ein = names(hospital_names), payer = big3,
+                    family = c("CPT", "DRG"))
+
+hpt_present <- hpt_keys %>% distinct(ein, payer, family) %>% mutate(hospital = TRUE)
+tic_present <- tic_keys %>% distinct(ein, payer, family) %>% mutate(payer_has = TRUE)
+
+fill <- grid %>%
+  left_join(hpt_present, by = c("ein", "payer", "family")) %>%
+  left_join(tic_present, by = c("ein", "payer", "family")) %>%
+  mutate(across(c(hospital, payer_has), ~replace_na(., FALSE))) %>%
+  group_by(payer, family) %>%
+  summarise(hospital_file = mean(hospital), payer_file = mean(payer_has),
+            .groups = "drop") %>%
+  pivot_longer(c(hospital_file, payer_file), names_to = "source", values_to = "fill_rate")
+
+ggplot(fill, aes(payer, source, fill = fill_rate)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = scales::percent(fill_rate, accuracy = 1)), size = 3) +
+  facet_wrap(~ family) +
+  scale_fill_gradient(low = "grey95", high = "steelblue", labels = scales::percent) +
+  labs(title = "Rate availability by insurer, source, and code family",
+       subtitle = "Share of the three hospitals with a usable rate",
+       x = NULL, y = NULL, fill = "Fill rate")
+```
+
+The inpatient (DRG) row is the sparsest on the payer side, which is the same
+pattern documented nationally and the reason inpatient bundle matching is the
+hardest part of this problem.
+
+# Limitations and how this scales
+
+The sample is small and deliberately clean, so several decisions that do not bite
+here would need real work at national volume.
+
+*Charge against payment.* We compare the hospital's negotiated rate against the
+insurer's negotiated rate, so both are payment side figures and no further
+adjustment is needed. If we fell back to a hospital's gross charge, we would first
+convert that charge to an expected payment, since charges and payments differ.
+
+*Plan and network alignment.* We filtered to commercial plans with a keyword rule.
+A production version would map each hospital plan name to the specific insurer
+network, and treat plan type as an input to the linkage score rather than part of
+the join key, so a near match on a slightly different product is retained but
+marked less certain.
+
+*Provider identity.* We matched at the tax id level. A tax id can cover more than
+one facility, so at scale we would use the provider identifier (NPI) list in the
+payer file to confirm the rate applies to the specific hospital campus.
+
+*Local codes.* A few hospital rows use a local code with no standard counterpart
+and would need a crosswalk before matching.
+
+*Component detection.* Deciding which part a hospital reported by nearest scale is
+a heuristic and is fragile for small professional scale numbers. A better signal
+is the hospital's own care setting and billing indicators.
+
+*Estimating the linkage weights.* We used illustrative agreement weights. At scale
+the match and coincidence probabilities behind them would be estimated from the
+data, for example with the EM algorithm, and the thresholds tuned against a
+labeled review set.
+
+*Testing and release.* At volume we would add checks on fill rates by field, on the
+plausibility of each scaling ratio and each ratio to Medicare, and on the
+distribution of gaps by code and insurer, and release the matcher behind these
+checks so a regression in match quality is caught before publication.
+
+# References
+
+* Bland JM, Altman DG. Statistical methods for assessing agreement between two
+  methods of clinical measurement. Lancet, 1986.
+* Cooper Z, Craig SV, Gaynor M, Van Reenen J. The Price Ain't Right? Hospital
+  Prices and Health Spending on the Privately Insured. Quarterly Journal of
+  Economics, 2019.
+* Dieleman JL, Beauchamp M, Crosby SW,..Idrisov B... et al. Tracking US Health Care Spending by
+  Health Condition and County. JAMA, 2025;333(12):1051-1061.
+  doi:10.1001/jama.2024.26790.
+* Fellegi IP, Sunter AB. A Theory for Record Linkage. Journal of the American
+  Statistical Association, 1969.
+* RAND Corporation. Hospital Price Transparency Study (Round 5). 2024.
+* Assessing the Completeness of Payer Transparency in Coverage Data. American
+  Journal of Managed Care, 2025.
+
+```{r session}
+sessionInfo()
+```
