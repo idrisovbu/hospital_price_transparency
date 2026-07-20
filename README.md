@@ -14,8 +14,10 @@ state how confident each match is.
 ## The full write-up
 
 The complete analysis, with every transformation and the reasoning behind it, is
-in `price_reconciliation.Rmd`. Read the knitted `price_reconciliation.html` for the narrative version, or
-open the `.Rmd` to see the code that produces each number.
+in `price_reconciliation.Rmd` which produced the knitted `price_reconciliation.html`. 
+You can just open this link https://htmlpreview.github.io/?https://github.com/idrisovbu/hospital_price_transparency/blob/main/price_reconciliation.html
+
+for the narrative version, or open the `.Rmd` and knit yourself. 
 
 ## Files
 
